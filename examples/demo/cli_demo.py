@@ -10,13 +10,17 @@ import os
 import platform
 import shutil
 from copy import deepcopy
-from threading import Thread
+from pathlib import Path
+import sys
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+# Add parent directory to path for imports
+sys.path.append(str(Path(__file__).parent.parent.parent))
+
+from qwen3.inference import InferenceManager
+from qwen3.config import ModelConfig, InferenceConfig
 from transformers.trainer_utils import set_seed
 
-DEFAULT_CKPT_PATH = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_CKPT_PATH = "Qwen/Qwen3-8B-Instruct"
 
 _WELCOME_MSG = """\
 Welcome to use Qwen2.5-Instruct model, type text to start chat, type :h to show command help.
@@ -80,30 +84,31 @@ def _setup_readline():
     readline.parse_and_bind("tab: complete")
 
 
-def _load_model_tokenizer(args):
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.checkpoint_path,
-        resume_download=True,
+def _setup_inference_manager(args):
+    """Setup inference manager with configurations."""
+    model_config = ModelConfig(
+        model_name_or_path=args.checkpoint_path,
+        device_map="cpu" if args.cpu_only else "auto"
     )
-
-    if args.cpu_only:
-        device_map = "cpu"
-    else:
-        device_map = "auto"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.checkpoint_path,
-        torch_dtype="auto",
-        device_map=device_map,
-        resume_download=True,
-    ).eval()
-    model.generation_config.max_new_tokens = 2048  # For chat.
-
-    return model, tokenizer
+    
+    inference_config = InferenceConfig(
+        max_new_tokens=2048,
+        enable_thinking=getattr(args, 'enable_thinking', None)
+    )
+    
+    manager = InferenceManager(engine_type='transformers')
+    manager.initialize(
+        model_name_or_path=args.checkpoint_path,
+        model_config=model_config,
+        inference_config=inference_config
+    )
+    
+    return manager
 
 
 def _gc():
     import gc
+    import torch
 
     gc.collect()
     if torch.cuda.is_available():
@@ -140,35 +145,21 @@ def _get_input() -> str:
         print("[ERROR] Query is empty")
 
 
-def _chat_stream(model, tokenizer, query, history):
+def _chat_stream(inference_manager, query, history):
+    """Generate streaming chat response."""
     conversation = []
     for query_h, response_h in history:
         conversation.append({"role": "user", "content": query_h})
         conversation.append({"role": "assistant", "content": response_h})
     conversation.append({"role": "user", "content": query})
-    input_text = tokenizer.apply_chat_template(
-        conversation,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-    inputs = tokenizer([input_text], return_tensors="pt").to(model.device)
-    streamer = TextIteratorStreamer(
-        tokenizer=tokenizer, skip_prompt=True, timeout=60.0, skip_special_tokens=True
-    )
-    generation_kwargs = {
-        **inputs,
-        "streamer": streamer,
-    }
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
-
-    for new_text in streamer:
+    
+    for new_text in inference_manager.stream_chat(conversation):
         yield new_text
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Qwen2.5-Instruct command-line interactive chat demo."
+        description="Qwen3-Instruct command-line interactive chat demo."
     )
     parser.add_argument(
         "-c",
@@ -181,12 +172,30 @@ def main():
     parser.add_argument(
         "--cpu-only", action="store_true", help="Run demo with CPU only"
     )
+    parser.add_argument(
+        "--enable-thinking", action="store_true", help="Enable thinking mode"
+    )
+    parser.add_argument(
+        "--disable-thinking", action="store_true", help="Disable thinking mode"
+    )
     args = parser.parse_args()
+    
+    # Handle thinking mode
+    if args.enable_thinking:
+        args.enable_thinking = True
+    elif args.disable_thinking:
+        args.enable_thinking = False
+    else:
+        args.enable_thinking = None  # Use model default
 
     history, response = [], ""
 
-    model, tokenizer = _load_model_tokenizer(args)
-    orig_gen_config = deepcopy(model.generation_config)
+    try:
+        inference_manager = _setup_inference_manager(args)
+        print("✅ Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Failed to load model: {e}")
+        return
 
     _setup_readline()
 
@@ -242,7 +251,14 @@ def main():
                     continue
             elif command in ["conf"]:
                 if len(command_words) == 1:
-                    print(model.generation_config)
+                    # Show current config
+                    config = inference_manager.engine.inference_config
+                    print(f"max_new_tokens: {config.max_new_tokens}")
+                    print(f"temperature: {config.temperature}")
+                    print(f"top_p: {config.top_p}")
+                    print(f"top_k: {config.top_k}")
+                    print(f"repetition_penalty: {config.repetition_penalty}")
+                    print(f"do_sample: {config.do_sample}")
                 else:
                     for key_value_pairs_str in command_words[1:]:
                         eq_idx = key_value_pairs_str.find("=")
@@ -260,14 +276,14 @@ def main():
                             continue
                         else:
                             print(
-                                f"[INFO] Change config: model.generation_config.{conf_key} = {conf_value}"
+                                f"[INFO] Change config: {conf_key} = {conf_value}"
                             )
-                            setattr(model.generation_config, conf_key, conf_value)
+                            setattr(inference_manager.engine.inference_config, conf_key, conf_value)
                 continue
             elif command in ["reset-conf"]:
                 print("[INFO] Reset generation config")
-                model.generation_config = deepcopy(orig_gen_config)
-                print(model.generation_config)
+                inference_manager.engine.inference_config = InferenceConfig()
+                print("Configuration reset to default")
                 continue
             else:
                 # As normal query.
@@ -280,7 +296,7 @@ def main():
         print(f"\nQwen: ", end="")
         try:
             partial_text = ""
-            for new_text in _chat_stream(model, tokenizer, query, history):
+            for new_text in _chat_stream(inference_manager, query, history):
                 print(new_text, end="", flush=True)
                 partial_text += new_text
             response = partial_text
